@@ -239,12 +239,6 @@ study_buddy/
 
 ---
 
-## 📄 License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
----
-
 ## 🙏 Acknowledgments
 
 - [LangChain](https://python.langchain.com/) for LLM orchestration

@@ -1,0 +1,799 @@
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_ENDPOINT="https://api.smith.langchain.com"
+LANGCHAIN_API_KEY="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"
+LANGCHAIN_PROJECT="Study-Buddy"
+
+#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
+
+
+"""
+AI Study Buddy V2 - Core Logic
+==============================
+This module handles all the heavy lifting behind the scenes - loading documents,
+creating embeddings, setting up the RAG pipeline, and generating study materials.
+
+V2 Features:
+- Universal Loader: Supports PDF and DOCX up to 200MB
+- Mark-Based Resolver: Detects marks (7, 4, 3, 2, One-liner) and enforces word limits
+- Enhanced Practice Mode: 10 quiz questions and 5+ flashcards
+- Smart Summarizer: Adjustable length (100-1000 words) with hallucination protection
+- LangSmith Tracing: Active for every query
+
+
+import os
+from dotenv import load_dotenv
+from langchain_ollama import OllamaEmbeddings, ChatOllama
+from langchain_community.vectorstores import FAISS
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredWordDocumentLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchainhub import Client as HubClient
+from langchain_core.runnables import RunnablePassthrough
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import PromptTemplate
+
+load_dotenv()
+
+os.environ["LANGCHAIN_TRACING_V2"] = "true"
+os.environ["LANGCHAIN_PROJECT"] = "ai-study-buddy"
+
+hub_client = HubClient()
+
+MAX_FILE_SIZE = 200 * 1024 * 1024
+
+def validate_file_size(file_path):
+    """Validate file size is under 200MB."""
+    file_size = os.path.getsize(file_path)
+    if file_size > MAX_FILE_SIZE:
+        raise ValueError(f"File size ({file_size / (1024*1024):.1f}MB) exceeds 200MB limit")
+    return file_size
+
+def load_document(file_path):
+    """
+    Universal Loader - Handles both PDF and DOCX files up to 200MB.
+    
+    Args:
+        file_path: Path to the uploaded file
+        
+    Returns:
+        List of LangChain Document objects
+    """
+    file_size = validate_file_size(file_path)
+    
+    file_extension = os.path.splitext(file_path)[1].lower()
+    
+    if file_extension == '.pdf':
+        loader = PyPDFLoader(file_path)
+    elif file_extension in ['.docx', '.doc']:
+        loader = UnstructuredWordDocumentLoader(file_path)
+    else:
+        raise ValueError(f"Unsupported file type: {file_extension}. Supported: PDF, DOCX")
+    
+    return loader.load()
+
+def process_document(file_path):
+    """
+    Load a PDF/DOCX file and convert it into a searchable vector database.
+    
+    Args:
+        file_path: Path to the file uploaded by the user
+        
+    Returns:
+        FAISS vector database
+    """
+    
+    docs = load_document(file_path)
+    
+    if not docs:
+        raise ValueError("No text could be extracted from the document")
+    
+    total_chars = sum(len(doc.page_content) for doc in docs)
+    
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1200, 
+        chunk_overlap=300
+    )
+    chunks = text_splitter.split_documents(docs)
+    
+    embeddings = OllamaEmbeddings(model="nomic-embed-text")
+    
+    vector_db = FAISS.from_documents(chunks, embeddings)
+    
+    vector_db.document_count = len(docs)
+    vector_db.total_chars = total_chars
+    
+    return vector_db
+
+
+OUT_OF_TOPIC_RESPONSE = "Sorry, you have entered an out-of-topic question. This information is not present in your uploaded documents."
+
+SIMILARITY_THRESHOLD = 0.5
+
+MARK_PROMPTS = {
+    "7": """Provide a comprehensive answer (approximately 350-420 words):
+- Start with a clear definition/introduction
+- Explain key concepts with examples
+- Include diagrams descriptions if applicable
+- Conclude with practical applications or importance
+- Use proper heading and bullet points for clarity
+IMPORTANT: Your answer must not exceed 420 words. If you exceed this limit, it is a failure.""",
+    
+    "4": """Provide a detailed answer (approximately 200 words):
+- Define the concept clearly
+- Explain main points with brief examples
+- Use bullet points for key aspects
+IMPORTANT: Your answer must not exceed 200 words. If you exceed this limit, it is a failure.""",
+    
+    "3": """Provide a concise answer (approximately 150 words):
+- State the main concept
+- Include 2-3 key points
+- Keep it brief but informative
+IMPORTANT: Your answer must not exceed 150 words. If you exceed this limit, it is a failure.""",
+    
+    "2": """Provide a short answer (approximately 80-100 words):
+- Give a direct definition
+- Include one key point or example
+IMPORTANT: Your answer must not exceed 100 words. If you exceed this limit, it is a failure.""",
+    
+    "1": """Provide a one-liner answer (approximately 30 words):
+- Give a brief, precise definition
+- Focus on the core concept only
+IMPORTANT: You MUST answer in EXACTLY ONE SENTENCE. Do not use multiple sentences. If you exceed 30 words or use more than one sentence, the response is a failure."""
+}
+
+def detect_marks(query):
+    """Detect mark requirements from the query."""
+    query_lower = query.lower()
+    
+    import re
+    mark_patterns = [
+        (r'\b(7\s*marks?|7\s*mark)\b', '7'),
+        (r'\b(4\s*marks?|4\s*mark)\b', '4'),
+        (r'\b(3\s*marks?|3\s*mark)\b', '3'),
+        (r'\b(2\s*marks?|2\s*mark)\b', '2'),
+        (r'\b(one\s*liner|one-liner|1\s*mark|1\s*mark)\b', '1'),
+    ]
+    
+    for pattern, marks in mark_patterns:
+        if re.search(pattern, query_lower):
+            return marks
+    
+    return None
+
+
+def truncate_one_liner(response):
+    """Post-process one-liner responses to ensure single sentence."""
+    if '.' in response:
+        first_period_idx = response.find('.')
+        if first_period_idx > 0:
+            response = response[:first_period_idx + 1].strip()
+    return response
+
+
+def get_qa_chain(vector_db):
+    """
+    Create a question-answering chain with Mark-Based Resolution.
+    
+    V2: Detects mark requirements (7, 4, 3, 2, One-liner) and enforces
+    strict page-length/word-count limits.
+    Includes strict guardrails for hallucination prevention and length enforcement.
+    
+    Args:
+        vector_db: The FAISS database containing our embedded document chunks
+        
+    Returns:
+        A function that takes a query and returns an answer
+    """
+    
+    llm = ChatOllama(model="llama3", temperature=0.3)
+    
+    retriever = vector_db.as_retriever(search_kwargs={"k": 5})
+    
+    def format_docs(retrieved_docs):
+        return "\n\n".join(doc.page_content for doc in retrieved_docs)
+    
+    def get_relevant_docs_with_score(query):
+        """Retrieve documents and return with similarity scores for thresholding."""
+        docs_with_scores = vector_db.similarity_search_with_score(query, k=5)
+        return docs_with_scores
+    
+    def create_mark_based_prompt(query):
+        detected_marks = detect_marks(query)
+        
+        if detected_marks:
+            mark_instruction = MARK_PROMPTS.get(detected_marks, "")
+            return PromptTemplate.from_template(f"""You are an academic bot. Your answer must be derived ONLY from the provided context. If the context contains even partial information about the topic, use it to answer. Only if there is zero mention of the topic should you use the 'out-of-topic' message.
+
+IMPORTANT: {mark_instruction}
+
+If the answer is not found in the context below, respond ONLY with: "Sorry, you have entered an out-of-topic question. This information is not present in your uploaded documents."
+
+Context: {{context}}
+
+Question: {{question}}
+
+Answer:""")
+        else:
+            return PromptTemplate.from_template("""You are an academic bot. Your answer must be derived ONLY from the provided context. If the context contains even partial information about the topic, use it to answer. Only if there is zero mention should you use the 'out-of-topic' message.
+
+You are a friendly and patient tutor helping students understand their study material.
+
+Your goal is to explain concepts in the simplest way possible, using:
+- Bullet points for clarity
+- Real-world analogies when helpful
+- Simple language that anyone can understand
+
+If you don't know something from the provided context, honestly say so - don't make things up!
+
+Context: {context}
+
+Question: {question}
+
+Helpful Answer:""")
+    
+    def build_chain(query):
+        docs_with_scores = get_relevant_docs_with_score(query)
+        
+        if not docs_with_scores:
+            return OUT_OF_TOPIC_RESPONSE
+        
+        min_score = min(score for doc, score in docs_with_scores)
+        
+        SIMILARITY_THRESHOLD = 1.5
+        if min_score < SIMILARITY_THRESHOLD:
+            return OUT_OF_TOPIC_RESPONSE
+        
+        retrieved_docs = [doc for doc, score in docs_with_scores]
+        
+        detected_marks = detect_marks(query)
+        
+        custom_prompt = create_mark_based_prompt(query)
+        
+        rag_chain = (
+            {
+                "context": lambda x: format_docs(retrieved_docs),
+                "question": RunnablePassthrough()
+            }
+            | custom_prompt
+            | llm
+            | StrOutputParser()
+        )
+        
+        response = rag_chain.invoke(query)
+        
+        if detected_marks == "1":
+            response = truncate_one_liner(response)
+        
+        return response
+    
+    return build_chain
+
+
+def generate_flashcards(vector_db, num_flashcards=5):
+    """
+    Generate flashcards from the uploaded study material.
+    
+    V2: Generates 5+ flashcards using st.expander format.
+    
+    Args:
+        vector_db: The FAISS database with our document content
+        num_flashcards: How many flashcards to generate (default is 5+)
+        
+    Returns:
+        A list of dictionaries with 'question' and 'answer' fields
+    """
+    
+    llm = ChatOllama(model="llama3", temperature=0.5)
+    
+    retriever = vector_db.as_retriever(search_kwargs={"k": 8})
+    
+    retrieved_docs = retriever.invoke("key concepts important points definitions")
+    context = "\n\n".join(doc.page_content for doc in retrieved_docs[:8])
+    
+    flashcard_prompt = PromptTemplate.from_template("""You are a study assistant creating flashcards for students.
+
+Based on the following study material, create {num} useful flashcards that test important concepts.
+Each flashcard should be self-contained and test a distinct concept.
+
+Format each flashcard as:
+Q: [Question]
+A: [Answer]
+
+Make sure questions are clear and answers are concise but complete.
+
+Study Material:
+{context}
+
+Flashcards:""")
+    
+    chain = flashcard_prompt | llm | StrOutputParser()
+    result = chain.invoke({
+        "num": num_flashcards,
+        "context": context
+    })
+    
+    flashcards = []
+    lines = result.split("\n")
+    current_q = None
+    current_a = None
+    
+    for line in lines:
+        line = line.strip()
+        if line.startswith("Q:") or line.startswith("Q1:"):
+            if current_q and current_a:
+                flashcards.append({"question": current_q, "answer": current_a})
+            current_q = line.split(":", 1)[1].strip()
+            current_a = None
+        elif line.startswith("A:") or line.startswith("A1:"):
+            current_a = line.split(":", 1)[1].strip()
+    
+    if current_q and current_a:
+        flashcards.append({"question": current_q, "answer": current_a})
+    
+    return flashcards if flashcards else [{"question": "Sample Q", "answer": "Sample A"}]
+
+
+def generate_quiz_questions(vector_db, num_questions=10):
+    """
+    Generate quiz questions for Practice Mode.
+    
+    V2: Creates 10 unique multiple-choice questions.
+    
+    Args:
+        vector_db: The FAISS database with our document content
+        num_questions: Number of questions to generate (default 10)
+        
+    Returns:
+        A list of dictionaries with 'question', 'options', and 'correct_answer' fields
+    """
+    
+    llm = ChatOllama(model="llama3", temperature=0.5)
+    
+    retriever = vector_db.as_retriever(search_kwargs={"k": 8})
+    
+    retrieved_docs = retriever.invoke("key concepts important facts definitions theories")
+    context = "\n\n".join(doc.page_content for doc in retrieved_docs[:8])
+    
+    quiz_prompt = PromptTemplate.from_template("""You are a study assistant creating quiz questions for students.
+
+Based on the following study material, create {num} unique multiple-choice quiz questions.
+Each question should have 4 options (A, B, C, D) with one correct answer.
+
+Format each question as:
+Q: [Question]
+A) [Option A]
+B) [Option B]
+C) [Option C]
+D) [Option D]
+ANSWER: [Correct letter]
+
+Make sure questions test understanding, not just memorization.
+
+Study Material:
+{context}
+
+Quiz Questions:""")
+    
+    chain = quiz_prompt | llm | StrOutputParser()
+    result = chain.invoke({
+        "num": num_questions,
+        "context": context
+    })
+    
+    questions = []
+    lines = result.split("\n")
+    
+    current_q = None
+    options = {}
+    correct_answer = None
+    
+    for line in lines:
+        line = line.strip()
+        if line.startswith("Q:") or line.startswith("Q1:"):
+            if current_q and options and correct_answer:
+                questions.append({
+                    "question": current_q,
+                    "options": options,
+                    "correct_answer": correct_answer
+                })
+            current_q = line.split(":", 1)[1].strip()
+            options = {}
+            correct_answer = None
+        elif line.startswith("A)") or line.startswith("A)"):
+            options["A"] = line.split(")", 1)[1].strip()
+        elif line.startswith("B)") or line.startswith("B)"):
+            options["B"] = line.split(")", 1)[1].strip()
+        elif line.startswith("C)") or line.startswith("C)"):
+            options["C"] = line.split(")", 1)[1].strip()
+        elif line.startswith("D)") or line.startswith("D)"):
+            options["D"] = line.split(")", 1)[1].strip()
+        elif line.upper().startswith("ANSWER:"):
+            correct_answer = line.split(":", 1)[1].strip().upper()
+    
+    if current_q and options and correct_answer:
+        questions.append({
+            "question": current_q,
+            "options": options,
+            "correct_answer": correct_answer
+        })
+    
+    return questions if questions else []
+
+
+def summarize_notes(vector_db, word_count=300):
+    """
+    Generate a summary of the uploaded notes.
+    
+    V2: Adjustable summary length (100-1000 words) with safety check
+    for small files to prevent hallucinations.
+    Includes strict word count enforcement using Python slicing.
+    
+    Args:
+        vector_db: The FAISS database with our document content
+        word_count: Target word count for summary (100-1000)
+        
+    Returns:
+        A string containing the summary
+    """
+    
+    if not hasattr(vector_db, 'total_chars'):
+        vector_db.total_chars = 5000
+    
+    safety_threshold = 1000
+    if vector_db.total_chars < safety_threshold:
+        word_count = min(word_count, 150)
+        warning = f"⚠️ Small document detected ({vector_db.total_chars} chars). Summary limited to {word_count} words to prevent hallucinations.\n\n"
+    else:
+        warning = ""
+    
+    llm = ChatOllama(model="llama3", temperature=0.3)
+    retriever = vector_db.as_retriever(search_kwargs={"k": 5})
+    
+    retrieved_docs = retriever.invoke("main topics key points key concepts")
+    context = "\n\n".join(doc.page_content for doc in retrieved_docs[:5])
+    
+    summary_prompt = PromptTemplate.from_template(f"""You are a helpful tutor creating a concise summary of study notes.
+
+Create a summary of approximately {word_count} words covering the main topics in these notes.
+Use simple language and focus on the most important concepts.
+
+Notes:
+{{context}}
+
+Summary:""")
+    
+    chain = summary_prompt | llm | StrOutputParser()
+    result = chain.invoke({"context": context})
+    
+    words = result.split()
+    if len(words) > word_count:
+        result = " ".join(words[:word_count])
+    
+    return warning + result     
+
+
+
+
+
+
+"""
+AI Study Buddy V2 - Streamlit Application
+==========================================
+This is the user interface of your Study Buddy app V2.
+
+V2 Features:
+- PDF and DOCX support up to 200MB
+- Mark-based answer system (7/4/3/2/One-liner)
+- Practice Mode with 10 quiz questions and 5+ flashcards
+- Smart Summarizer with adjustable length (100-1000 words)
+- LangSmith tracing enabled for all queries
+"""
+
+import streamlit as st
+from core_logic import (
+    process_document, 
+    get_qa_chain, 
+    generate_flashcards, 
+    generate_quiz_questions,
+    summarize_notes,
+    truncate_one_liner,
+    detect_marks
+)
+
+
+st.set_page_config(
+    page_title="AI Study Buddy V2",
+    page_icon="📚",
+    layout="wide"
+)
+
+
+def initialize_session_state():
+    if "vector_db" not in st.session_state:
+        st.session_state.vector_db = None
+    
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+    
+    if "quiz_score" not in st.session_state:
+        st.session_state.quiz_score = 0
+    
+    if "quiz_answered" not in st.session_state:
+        st.session_state.quiz_answered = set()
+
+
+def render_sidebar():
+    with st.sidebar:
+        st.header("📄 Upload Your Notes")
+        st.write("Upload your study notes (PDF/DOCX up to 200MB)")
+        
+        uploaded_file = st.file_uploader(
+            "Choose a file",
+            type=["pdf", "docx", "doc"],
+            help="Upload PDF or DOCX files up to 200MB"
+        )
+        
+        if uploaded_file:
+            file_size_mb = uploaded_file.size / (1024 * 1024)
+            st.success(f"📎 Selected: {uploaded_file.name} ({file_size_mb:.1f}MB)")
+            
+            if file_size_mb > 200:
+                st.error("❌ File exceeds 200MB limit. Please upload a smaller file.")
+            else:
+                process_btn = st.button(
+                    "🚀 Start Indexing", 
+                    type="primary",
+                    help="Process your document and make it searchable"
+                )
+                
+                if process_btn:
+                    with st.spinner("📚 Processing your notes... This may take a moment..."):
+                        import tempfile
+                        import os
+                        
+                        suffix = os.path.splitext(uploaded_file.name)[1]
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp_file:
+                            tmp_file.write(uploaded_file.getbuffer())
+                            temp_path = tmp_file.name
+                        
+                        try:
+                            st.session_state.vector_db = process_document(temp_path)
+                            st.success("✅ All done! Your notes are ready to chat with!")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error processing file: {str(e)}")
+                        finally:
+                            os.remove(temp_path)
+        
+        st.divider()
+        st.info("💡 **Tips:**\n\n"
+                 "• Upload clear, text-based PDFs or DOCXs\n\n"
+                 "• Use '7 marks', '4 marks', etc. in questions for exam-style answers\n\n"
+                 "• Try Practice Mode for quizzes and flashcards!\n\n"
+                 "• **Anti-Hallucination**: Out-of-topic questions will be rejected")
+        
+        if st.session_state.vector_db:
+            st.divider()
+            if st.button("🗑️ Clear Uploaded Notes"):
+                st.session_state.vector_db = None
+                st.session_state.chat_history = []
+                st.session_state.quiz_score = 0
+                st.session_state.quiz_answered = set()
+                st.rerun()
+
+
+def render_main_content():
+    st.title("📚 AI Study Buddy V2")
+    st.write("Your personal AI tutor powered by your own study notes!")
+    
+    if not st.session_state.vector_db:
+        render_welcome_screen()
+        return
+    
+    tab1, tab2, tab3 = st.tabs([
+        "💬 Ask Questions", 
+        "🎯 Practice Mode", 
+        "📝 Summarize"
+    ])
+    
+    with tab1:
+        render_qa_interface()
+    
+    with tab2:
+        render_practice_mode()
+    
+    with tab3:
+        render_summary_interface()
+
+
+def render_welcome_screen():
+    st.markdown("""
+    ## 🎓 Welcome to AI Study Buddy V2!
+    
+    Your intelligent study companion with enhanced features:
+    
+    ### ✨ V2 New Features
+    
+    | Feature | Description |
+    |---------|-------------|
+    | **7-Mark Logic** | Get exam-ready answers with proper mark distribution |
+    | **200MB Support** | Process large PDF and DOCX files |
+    | **Practice Mode** | 10 quiz questions + 5+ flashcards |
+    | **Smart Summarizer** | Adjustable summary (100-1000 words) |
+    | **Anti-Hallucination** | Rejects out-of-topic questions automatically |
+    | **Strict Length Enforcement** | Answers match academic word limits exactly |
+    
+    ### 🚀 Getting Started
+    
+    1. **Upload your notes** using the sidebar (PDF or DOCX, up to 200MB)
+    2. Click **Start Indexing** to process your material
+    3. Switch between tabs to explore different study modes!
+    """)
+    
+    with st.expander("❓ How to use mark-based answers"):
+        st.markdown("""
+        **Ask questions like:**
+        - "Explain TCP vs UDP with 7 marks"
+        - "What is an algorithm? 4 marks"
+        - "Define Big O notation (2 marks)"
+        - "What is recursion? one-liner"
+        
+        The AI will format answers according to GTU exam standards!
+        """)
+
+
+def render_qa_interface():
+    st.header("💬 Ask Questions from Your Notes")
+    st.write("Ask me anything about your uploaded study material!")
+    st.info("💡 Tip: Include '7 marks', '4 marks', etc. in your question for exam-style answers!")
+    
+    if st.session_state.chat_history:
+        st.subheader("📝 Previous Questions")
+        for i, (q, a) in enumerate(st.session_state.chat_history):
+            with st.container():
+                st.markdown(f"**Q{i+1}: {q}**")
+                st.markdown(f"```\n{a}\n```")
+                st.divider()
+    
+    query = st.text_input(
+        "Type your question here:",
+        placeholder="e.g., What is the difference between TCP and UDP (7 marks)?",
+        key="question_input"
+    )
+    
+    if st.button("🔍 Get Answer", type="primary") and query:
+        with st.spinner("🤔 Thinking..."):
+            chain_builder = get_qa_chain(st.session_state.vector_db)
+            chain_or_response = chain_builder(query)
+            
+            if isinstance(chain_or_response, str):
+                response = chain_or_response
+            else:
+                response = chain_or_response.invoke(query)
+            
+            st.session_state.chat_history.append((query, response))
+            
+            if detect_marks(query) == "1":
+                response = truncate_one_liner(response)
+            
+            st.success("💡 Here's what I found:")
+            st.markdown(response)
+
+
+def render_practice_mode():
+    st.header("🎯 Practice Mode")
+    st.write("Test your knowledge with quizzes and flashcards!")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("🃏 Flashcards")
+        if st.button("🎴 Generate Flashcards", type="primary"):
+            with st.spinner("🎨 Creating flashcards..."):
+                flashcards = generate_flashcards(st.session_state.vector_db, num_flashcards=5)
+                st.session_state.current_flashcards = flashcards
+    
+    with col2:
+        st.subheader("❓ Quiz")
+        if st.button("📝 Generate Quiz Questions", type="primary"):
+            with st.spinner("📝 Creating quiz questions..."):
+                questions = generate_quiz_questions(st.session_state.vector_db, num_questions=10)
+                st.session_state.quiz_questions = questions
+                st.session_state.quiz_score = 0
+                st.session_state.quiz_answered = set()
+    
+    st.divider()
+    
+    if "quiz_questions" in st.session_state and st.session_state.quiz_questions:
+        st.subheader(f"📋 Quiz ({len(st.session_state.quiz_questions)} Questions)")
+        st.write(f"**Score: {st.session_state.quiz_score} / {len(st.session_state.quiz_questions)}**")
+        
+        for i, q in enumerate(st.session_state.quiz_questions, 1):
+            with st.expander(f"Question {i}", expanded=False):
+                st.markdown(f"**{q['question']}**")
+                
+                options = q["options"]
+                correct_key = q["correct_answer"]
+                correct_text = options.get(correct_key, "")
+                
+                for opt_key, opt_val in options.items():
+                    col_a, col_b = st.columns([1, 10])
+                    with col_a:
+                        if i in st.session_state.quiz_answered:
+                            if opt_key == q["correct_answer"]:
+                                st.success(f"**{opt_key})** {opt_val} ✓")
+                            elif opt_key == st.session_state.get(f"q{i}_answer"):
+                                st.error(f"**{opt_key})** {opt_val} ✗")
+                            else:
+                                st.write(f"**{opt_key})** {opt_val}")
+                        else:
+                            if st.button(f"{opt_key}", key=f"q{i}_{opt_key}"):
+                                st.session_state[f"q{i}_answer"] = opt_key
+                                if opt_key == q["correct_answer"]:
+                                    st.session_state.quiz_score += 1
+                                    st.success(f"✅ Correct! The answer is {opt_key}) {opt_val}")
+                                else:
+                                    st.error(f"❌ Incorrect! The correct answer is {correct_key}) {correct_text}")
+                                st.session_state.quiz_answered.add(i)
+                                st.rerun()
+                    with col_b:
+                        if i not in st.session_state.quiz_answered:
+                            st.write(f"**{opt_key})** {opt_val}")
+                
+                if i in st.session_state.quiz_answered:
+                    st.markdown(f"**Correct Answer: {q['correct_answer']}**")
+    
+    st.divider()
+    
+    if "current_flashcards" in st.session_state:
+        flashcards = st.session_state.current_flashcards
+        
+        if not flashcards:
+            st.warning("No flashcards could be generated.")
+            return
+        
+        st.subheader(f"🃏 {len(flashcards)} Flashcards Ready!")
+        
+        for i, card in enumerate(flashcards, 1):
+            with st.expander(f"🔹 Flashcard {i}"):
+                st.markdown(f"**Question:** {card['question']}")
+                st.markdown("---")
+                st.markdown(f"**Answer:** {card['answer']}")
+        
+        st.info("💡 **Study Tip:** Try to answer each question before revealing the answer! "
+                "This active recall technique significantly improves retention.")
+
+
+def render_summary_interface():
+    st.header("📝 Smart Summarizer")
+    st.write("Get a quick overview of what your notes cover!")
+    
+    word_count = st.slider(
+        "Summary Length (words)",
+        min_value=100,
+        max_value=1000,
+        value=300,
+        step=50,
+        help="Adjust the summary length from 100 to 1000 words. Output will be strictly trimmed to this limit."
+    )
+    
+    st.caption(f"📏 Target: {word_count} words (output is strictly enforced)")
+    
+    if st.button("📋 Generate Summary", type="primary"):
+        with st.spinner("📑 Reading through your notes..."):
+            summary = summarize_notes(st.session_state.vector_db, word_count=word_count)
+            st.session_state.current_summary = summary
+    
+    if "current_summary" in st.session_state:
+        summary = st.session_state.current_summary
+        if summary:
+            st.success("📌 Key Takeaways:")
+            st.markdown(summary)
+            
+            word_count_actual = len(summary.split())
+            st.caption(f"📊 Actual word count: ~{word_count_actual} words")
+
+
+if __name__ == "__main__":
+    initialize_session_state()
+    render_sidebar()
+    render_main_content()
